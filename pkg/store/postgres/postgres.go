@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,6 +15,14 @@ import (
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
+
+// migrationAdvisoryLockID serializes schema migrations across every process
+// connected to the same Postgres database. Cloud deployments start the main
+// and proxy services concurrently; without a database-scoped lock they can
+// both take the same snapshot of schema_migrations and race the same DDL.
+//
+// The value is the ASCII bytes for "Clawviso" interpreted as a signed int64.
+const migrationAdvisoryLockID int64 = 0x436c61777669736f
 
 // New creates a pgxpool connection pool and runs pending migrations.
 func New(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
@@ -56,8 +65,34 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 //     ADD COLUMN / CREATE INDEX / CREATE TABLE shapes — see
 //     isMigrationAlreadyAppliedErr.
 func runMigrationsFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS) error {
+	// Advisory locks are session-scoped, so pin all migration work to one pool
+	// connection. Releasing the connection also releases the lock if the
+	// explicit unlock fails during cancellation or shutdown.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring migration connection: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationAdvisoryLockID); err != nil {
+		return fmt.Errorf("acquiring migration advisory lock: %w", err)
+	}
+	defer func() {
+		// Deliberately not derived from ctx: cleanup has to run even when the
+		// caller's context is already cancelled (a startup abort), which is
+		// exactly when the unlock matters most. It is bounded instead, because
+		// this defer runs before the deferred conn.Release() above — an
+		// unresponsive database would otherwise block here forever and leak the
+		// connection, turning a failed startup into a hang. Best effort only:
+		// the session releases the lock when conn is released, so a timed-out
+		// or failed unlock is not fatal.
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationAdvisoryLockID)
+	}()
+
 	// Create migrations tracking table
-	_, err := pool.Exec(ctx, `
+	_, err = conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			name       TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -68,7 +103,7 @@ func runMigrationsFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS) 
 	}
 
 	// Read applied migrations
-	rows, err := pool.Query(ctx, `SELECT name FROM schema_migrations ORDER BY name`)
+	rows, err := conn.Query(ctx, `SELECT name FROM schema_migrations ORDER BY name`)
 	if err != nil {
 		return err
 	}
@@ -108,7 +143,7 @@ func runMigrationsFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS) 
 			return fmt.Errorf("reading migration %s: %w", entry.Name(), err)
 		}
 
-		tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+		tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
 		if err != nil {
 			return fmt.Errorf("begin migration %s: %w", entry.Name(), err)
 		}
@@ -121,7 +156,7 @@ func runMigrationsFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS) 
 			// failed DDL in Postgres, so roll back and reopen.
 			if isMigrationAlreadyAppliedErr(err) {
 				_ = tx.Rollback(ctx)
-				if _, err := pool.Exec(ctx,
+				if _, err := conn.Exec(ctx,
 					`INSERT INTO schema_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING`,
 					entry.Name(),
 				); err != nil {
