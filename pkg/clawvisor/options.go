@@ -88,6 +88,17 @@ type GatewayHooks struct {
 	BeforeAuthorize func(ctx context.Context, agentID, userID, service, action string) error
 }
 
+// TaskHooks allows cloud/enterprise layers to gate task creation.
+type TaskHooks struct {
+	// BeforeCreate runs before a task is created. Returning an error refuses
+	// the task. Gating at the router only covers POST /api/tasks, which is why
+	// this hook exists.
+	//
+	// Covers POST /api/tasks, MCP tool dispatch, and the inline LLM-proxy
+	// entries. Runtime-event promotion is not yet routed through it.
+	BeforeCreate func(ctx context.Context, agent *store.Agent) error
+}
+
 // FeedbackHooks allows cloud/enterprise layers to react to feedback events.
 type FeedbackHooks struct {
 	// AfterBugReport is called after a bug report is successfully saved.
@@ -162,6 +173,9 @@ type ServerOptions struct {
 	// SkipBuiltinAuth prevents the core server from registering its built-in
 	// login/register/password routes, allowing ExtraRoutes to provide custom auth.
 	SkipBuiltinAuth bool
+
+	// TaskHooks gates task creation across every creation path.
+	TaskHooks *TaskHooks
 
 	// GatewayHooks injects additional authorization logic into the gateway flow.
 	// Used by cloud for org-level restrictions, policies, etc.
