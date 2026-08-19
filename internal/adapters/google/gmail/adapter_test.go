@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -540,6 +541,151 @@ func TestArchiveMessage_RequiresMessageID(t *testing.T) {
 	adapter := &GmailAdapter{}
 	if _, err := adapter.archiveMessage(context.Background(), &http.Client{}, map[string]any{}); err == nil {
 		t.Fatal("expected error when message_id missing")
+	}
+}
+
+func TestModifyLabels_AddsAndRemovesLabels(t *testing.T) {
+	var sentPayload struct {
+		AddLabelIDs    []string `json:"addLabelIds"`
+		RemoveLabelIDs []string `json:"removeLabelIds"`
+	}
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/messages/msg-1/modify") {
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+			}
+			data, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read request body: %v", err)
+			}
+			if err := json.Unmarshal(data, &sentPayload); err != nil {
+				t.Fatalf("unmarshal modify payload: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"id":"msg-1","threadId":"thread-1","labelIds":["Label_1","STARRED"]}`)),
+			}, nil
+		}),
+	}
+
+	result, err := (&GmailAdapter{}).modifyLabels(context.Background(), client, map[string]any{
+		"message_id":       "msg-1",
+		"add_label_ids":    []any{"Label_1"},
+		"remove_label_ids": []any{"INBOX"},
+	})
+	if err != nil {
+		t.Fatalf("modifyLabels error: %v", err)
+	}
+	if len(sentPayload.AddLabelIDs) != 1 || sentPayload.AddLabelIDs[0] != "Label_1" {
+		t.Fatalf("addLabelIds = %v, want [Label_1]", sentPayload.AddLabelIDs)
+	}
+	if len(sentPayload.RemoveLabelIDs) != 1 || sentPayload.RemoveLabelIDs[0] != "INBOX" {
+		t.Fatalf("removeLabelIds = %v, want [INBOX]", sentPayload.RemoveLabelIDs)
+	}
+	data := result.Data.(map[string]any)
+	if data["message_id"] != "msg-1" || data["thread_id"] != "thread-1" {
+		t.Fatalf("result data = %v, want message and thread IDs", data)
+	}
+}
+
+func TestModifyLabels_ValidatesRequest(t *testing.T) {
+	adapter := &GmailAdapter{}
+	for name, params := range map[string]map[string]any{
+		"missing message ID":        {},
+		"no label changes":          {"message_id": "msg-1"},
+		"non-string label":          {"message_id": "msg-1", "add_label_ids": []any{42}},
+		"empty label":               {"message_id": "msg-1", "remove_label_ids": []any{""}},
+		"duplicate label":           {"message_id": "msg-1", "add_label_ids": []any{"STARRED", "STARRED"}},
+		"conflicting label changes": {"message_id": "msg-1", "add_label_ids": []any{"STARRED"}, "remove_label_ids": []any{"STARRED"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := adapter.modifyLabels(context.Background(), &http.Client{}, params); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestLabelIDsParam_RejectsCanonicalDuplicates(t *testing.T) {
+	_, err := labelIDsParam(map[string]any{
+		"add_label_ids": []any{"  STARRED  ", "STARRED"},
+	}, "add_label_ids")
+	if err == nil {
+		t.Fatal("expected canonical duplicate label ID error")
+	}
+}
+
+func TestModifyLabels_RejectsCanonicalConflictsBeforeHTTP(t *testing.T) {
+	var requests atomic.Int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return nil, errors.New("unexpected HTTP request")
+		}),
+	}
+
+	_, err := (&GmailAdapter{}).modifyLabels(context.Background(), client, map[string]any{
+		"message_id":       "msg-1",
+		"add_label_ids":    []any{"  STARRED  "},
+		"remove_label_ids": []any{"STARRED"},
+	})
+	if err == nil {
+		t.Fatal("expected canonical conflicting label changes error")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("HTTP requests = %d, want 0", requests.Load())
+	}
+}
+
+func TestModifyLabels_SendsCanonicalLabelIDs(t *testing.T) {
+	var sentPayload struct {
+		AddLabelIDs    []string `json:"addLabelIds"`
+		RemoveLabelIDs []string `json:"removeLabelIds"`
+	}
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			data, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read request body: %v", err)
+			}
+			if err := json.Unmarshal(data, &sentPayload); err != nil {
+				t.Fatalf("unmarshal modify payload: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"id":"msg-1","threadId":"thread-1","labelIds":[]}`)),
+			}, nil
+		}),
+	}
+
+	_, err := (&GmailAdapter{}).modifyLabels(context.Background(), client, map[string]any{
+		"message_id":       "msg-1",
+		"add_label_ids":    []any{"  Label_1  "},
+		"remove_label_ids": []any{" INBOX "},
+	})
+	if err != nil {
+		t.Fatalf("modifyLabels error: %v", err)
+	}
+	if got, want := sentPayload.AddLabelIDs, []string{"Label_1"}; !slices.Equal(got, want) {
+		t.Fatalf("addLabelIds = %v, want %v", got, want)
+	}
+	if got, want := sentPayload.RemoveLabelIDs, []string{"INBOX"}; !slices.Equal(got, want) {
+		t.Fatalf("removeLabelIds = %v, want %v", got, want)
+	}
+}
+
+func TestModifyLabels_IsSupportedAndRequiresModifyScope(t *testing.T) {
+	adapter := New(nil)
+	if !containsString(adapter.SupportedActions(), "modify_labels") {
+		t.Fatalf("SupportedActions() = %v, want modify_labels", adapter.SupportedActions())
+	}
+	if err := adapter.requireModifyScope(testGoogleCredential(t, gmailModifyScope), "modify_labels", "label-modification permissions"); err != nil {
+		t.Fatalf("requireModifyScope with gmail.modify: %v", err)
+	}
+	if err := adapter.requireModifyScope(testGoogleCredential(t, "https://www.googleapis.com/auth/gmail.readonly"), "modify_labels", "label-modification permissions"); err == nil {
+		t.Fatal("expected missing gmail.modify error")
 	}
 }
 
